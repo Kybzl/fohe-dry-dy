@@ -1,0 +1,707 @@
+# 工业烘干短视频素材库 Agent - runtime configuration (Milestone 2).
+#
+# Secrets (API keys) must NOT be placed in this file. Put them in .env instead.
+
+app:
+  name: "工业烘干短视频素材库 Agent"
+  log_level: "INFO"
+
+# ---------------------------------------------------------------------------
+# Storage layout.
+#   library_root : final clips + thumbnails (absolute path used as is)
+#   database_path: SQLite index, kept inside the project
+#   cache_root   : temporary files (sampled frames, working copies)
+# Relative paths are resolved against the project root; absolute paths
+# (Windows drive letters, UNC shares, POSIX paths) are used verbatim.
+# Any machine can override these without editing this tracked file by setting
+# FOHE_LIBRARY_ROOT / FOHE_DATABASE_PATH / FOHE_CACHE_ROOT in its local .env.
+# ---------------------------------------------------------------------------
+storage:
+  # 最终素材库：保存 <物料>/clips、thumbnails、clean。默认沿用本机 D 盘；
+  # 换电脑时优先在本地 .env 设置 FOHE_LIBRARY_ROOT，不要提交盘符差异。
+  library_root: "D:/素材库2"
+  # SQLite 索引：记录视频、片段、标签、任务、审核和云处理状态；相对路径
+  # 会跟随项目目录迁移。可用 FOHE_DATABASE_PATH 覆盖。
+  database_path: "./data/library.db"
+  # 临时缓存：下载工作文件、抽帧和云处理临时文件，可安全清理；可用
+  # FOHE_CACHE_ROOT 覆盖，建议与项目一起放在非系统盘。
+  cache_root: "./cache"
+
+# Logs and other project-local state (storage.* above is the canonical source
+# for the library/database/cache paths; this section keeps the log location).
+paths:
+  data_dir: "data"
+  log_dir: "logs"
+
+# ---------------------------------------------------------------------------
+# Platform sources. Milestone 2 ships "local" (local test videos).
+# Douyin stays a placeholder until Milestone 3.
+# ---------------------------------------------------------------------------
+sources:
+  # local | mock | douyin (Milestone 3)
+  active_source: "douyin"
+  registry:
+    local: "sources.local:LocalFileSource"
+    mock: "sources.mock:MockVideoSource"
+    douyin: "sources.douyin:DouyinSource"
+    bilibili: "sources.bilibili:BilibiliSource"
+    tiktok: "sources.tiktok:TikTokSource"
+    xiaohongshu: "sources.xiaohongshu:XiaohongshuSource"
+  enabled:
+    - "douyin"
+    - "local"
+  search_limit_per_query: 8
+  request_timeout_seconds: 20
+  max_retries: 3
+  # -------------------------------------------------------------------------
+  # Douyin acquisition goes through a self-hosted backend over HTTP:
+  #   fohe-dy  --HTTP-->  Douyin_TikTok_Download_API (dtk v5)  -->  Douyin
+  # See docs/douyin_backend.md for install/run/version notes.
+  # -------------------------------------------------------------------------
+  douyin:
+    backend: "dtk"
+    base_url: "http://127.0.0.1:8000"
+    # Backends tried in order when base_url does not answer/authenticate
+    # (Milestone 3.6 section 3). A configured-but-dead local backend no longer
+    # blocks the whole run when a working remote dtk is listed here. The
+    # recommended way to point at another instance is the environment variable
+    # DOUYIN_BACKEND_BASE_URL (see .env.example); this list is the persistent
+    # fallback for headless/CI use.
+    # 实测可用的远端 dtk（M8.3 验收机器）：
+    #   - 本地 127.0.0.1:8000 未运行时，解析器会按顺序探测这里的地址；
+    #   - 认证走已有的安全机制：.env 里的 DOUYIN_BACKEND_API_KEY 或
+    #     DOUYIN_BACKEND_SESSION_COOKIE（绝不写进 config.yaml/源码）；
+    #   - 只有「可达 且 认证通过」的后端才会被选中，全部不可用才 backend_blocked。
+    fallback_base_urls:
+      - "https://demo.douyin.wtf"
+    # API key is read from this environment variable (see .env / .env.example).
+    api_key_env: "DOUYIN_BACKEND_API_KEY"
+    api_key: ""                    # avoid inline keys; prefer the env var
+    request_timeout_seconds: 30
+    task_wait_seconds: 20          # ?wait= while submitting (backend max 30)
+    task_poll_interval_seconds: 1
+    search_page_size: 20
+    max_search_pages_per_query: 3
+    max_candidates_per_query: 50
+    max_candidates_per_task: 200
+    concurrent_requests: 2         # conservative by design
+    # Environment proxy policy for this connection. Omitted/null = auto:
+    # a localhost backend (127.0.0.1 / localhost) never uses HTTP(S)_PROXY,
+    # while remote backends keep httpx's default (honour the environment).
+    trust_env: null
+    # This machine's FFmpeg cannot open Douyin CDN streams directly.  The HTTP
+    # downloader is reliable, so sample locally after staging instead.
+    enable_remote_preview: false
+    remote_preview_frames: 8
+    media_url_refresh_attempts: 1  # media URLs are signed and expire
+    retry_rejected_after_days: 30
+    retry_failed_after_hours: 24
+    # duration/media resolution failure is an execution retry, not content rejection
+    duration_resolution_retry_hours: 6.0
+    # The reference backend (dtk v5) exposes NO keyword search endpoint.
+    # Discovery therefore happens in this order (see section 15 of the
+    # Milestone 3.5 spec and docs/douyin_backend.md):
+    #   1. dtk keyword search  - only if the connected instance exposes one
+    #   2. browser search      - Playwright over public www.douyin.com search
+    #   3. archive / author / mix / manual URL discovery
+    discovery:
+      author_sec_uids: []          # GET /api/v1/douyin/user/posts
+      mix_ids: []                  # GET /api/v1/douyin/mix/posts
+      archive_search: true         # GET /api/v1/archive?q=<keyword>
+      manual_urls: []              # explicit post URLs
+    # -----------------------------------------------------------------------
+    # Playwright based discovery. Only public Douyin search pages are used;
+    # no CAPTCHA solving, no stealth, no credential automation. If Douyin
+    # asks for a slider/login the browser window is left open for the
+    # operator (see app.py --init-douyin-browser).
+    # -----------------------------------------------------------------------
+    browser_search:
+      enabled: true
+      profile_dir: "./browser_data/douyin"
+      headless: false              # keep false for first-time manual verification
+      # Which browser engine drives the isolated persistent profile.
+      #   auto      -> installed Chrome, else Edge, else bundled Chromium
+      #   chromium  -> Playwright's bundled Chromium
+      #   chrome    -> an installed Google Chrome (channel="chrome")
+      #   msedge    -> an installed Microsoft Edge (channel="msedge")
+      # This is session consistency only: no fingerprint spoofing, no stealth
+      # plugin, no CAPTCHA bypass, no proxy rotation.
+      browser_channel: "auto"
+      browser_executable_path: ""  # optional explicit binary; wins if it exists
+      # ---- Milestone 8.3：优先使用「操作者自己的浏览器」（V3.2 模型）----
+      # 实测：Playwright 自己启动的 Chrome 会被抖音识别为自动化，搜索页只渲染
+      # 空壳卡片（16 个空 <li>、无 /video/ 链接、captcha_container 拦截点击）；
+      # 同一个 profile 用普通 Chrome 启动后通过 CDP 接入，则能拿到真实结果链接。
+      # 用法：
+      #   python app.py --open-douyin-browser      # 普通方式启动 Chrome（含调试端口）
+      #   python app.py --verify-douyin-browser    # CDP 接入同一浏览器做人工验证
+      # 留空 = 自动：如果 cdp_port 上已经有操作者启动的浏览器就接入它，
+      # 否则退回「自己启动浏览器」的旧行为（不需要改配置）。
+      # 也可以写成 "http://127.0.0.1:9222" 强制接入，或 "off" 强制自己启动。
+      cdp_url: ""
+      # 专用端口：避免与其他项目（它们也默认用 9222）抢同一个浏览器调试连接，
+      # 否则会出现「HTTP 200 但 CDP websocket 握手超时」的 browser_unavailable。
+      cdp_port: 9230
+      locale: "zh-CN"
+      viewport_width: 1440
+      viewport_height: 900
+      slow_mo_ms: 0
+      max_scrolls_per_query: 8
+      scroll_delay_seconds: 1.0
+      max_results_per_query: 50
+      navigation_timeout_seconds: 30
+      page_settle_seconds: 6
+      keep_context_open: true
+      keep_open_on_challenge: true
+      # 遇到滑块/登录墙时保留当前页面并暂停任务；人工完成后程序自动检测、
+      # 重试同一搜索词。这里只轮询页面状态，不破解验证码。
+      auto_resume_after_verification: true
+      challenge_wait_timeout_seconds: 300
+      challenge_poll_seconds: 4
+      # After this many consecutive *successful* searches that returned no
+      # results, stop driving the browser for the remaining keywords of the
+      # task. This is a yield guard (the task still reports "search ran, zero
+      # results"), never a "blocked" classification.
+      empty_result_limit: 3
+      # 502/503/504 from the edge are treated as bounded transient upstream
+      # errors: at most this many retries with linear backoff, then give up
+      # (the whole task stops retrying that gateway).
+      upstream_retry_count: 2
+      upstream_retry_backoff_seconds: 2.0
+      # Milestone 8.2：人工验证解除后，抖音会自行跳转/水合搜索页。
+      # 这里是「页面自身稳定」的有界等待（秒），不是人工验证超时。
+      search_settle_timeout_seconds: 20
+      search_settle_poll_seconds: 1.0
+    # Routes probed on the live backend to detect a keyword-search capability.
+    search_endpoint_candidates:
+      - "/api/v1/douyin/search"
+      - "/api/v1/douyin/search/general"
+      - "/api/v1/search"
+      - "/api/v1/content/search"
+  local:
+    extensions:
+      - ".mp4"
+      - ".mov"
+      - ".m4v"
+    recursive: false
+    copy_to_cache: true
+  mock:
+    seed: 20260914
+    write_placeholder_media: true
+
+# ---------------------------------------------------------------------------
+# AI vision providers.
+#   Qwen is the primary provider, Volcano Engine the fallback.
+#   Model names are configuration driven; empty means "use the value from the
+#   environment (.env) or the built-in default".
+# ---------------------------------------------------------------------------
+ai:
+  active_provider: "qwen"
+  fallback_provider: null
+  registry:
+    mock: "ai.mock:MockVisionProvider"
+    qwen: "ai.qwen:QwenProvider"
+    volcano: "ai.volcano:VolcanoProvider"
+  request_timeout_seconds: 60
+  max_retries: 2
+  retry_backoff_seconds: 1.5
+  qwen:
+    # Empty value -> use QWEN_VISION_MODEL from .env, then the built-in default.
+    # Replace these names with whatever your Model Studio account provides.
+    # 生产模型（运营者指定）：preview_filter / segment_detection / clip_tagging
+    # 全部走同一个生产模型；模型名只写在配置里，不写进 Python 代码。
+    preview_model: ""
+    analysis_model: ""
+    fallback_model: ""
+    use_json_mode: true
+  volcano:
+    model: ""
+    endpoint: ""
+    use_json_mode: true
+  limits:
+    max_preview_frames: 16
+    max_ai_calls_per_source: 5
+    max_retries: 2
+    confidence_escalation_threshold: 0.70
+  # Milestone 9.7 provider readiness gate (no background polling)
+  provider_readiness:
+    enabled: true
+    timeout_seconds: 20
+    transient_retry_count: 2
+    transient_backoff_seconds: 1.5
+
+# ---------------------------------------------------------------------------
+# Collection budgets: a target of 20 clips must never mean "download 20 videos".
+# ---------------------------------------------------------------------------
+collection:
+  max_candidates_per_task: 200
+  max_source_downloads_per_task: 50
+  max_ai_calls_per_task: 300
+  max_task_runtime_minutes: 60
+  initial_candidate_multiplier: 5
+  stop_when_target_reached: true
+
+# ---------------------------------------------------------------------------
+# Debugging switches.
+# ---------------------------------------------------------------------------
+debug:
+  keep_source_videos: false      # true keeps staged sources in cache/ (debug only)
+  keep_rejected_sources: false
+
+# ---------------------------------------------------------------------------
+# Conservative single-machine performance defaults.
+# ---------------------------------------------------------------------------
+performance:
+  douyin_concurrency: 2
+  downloads: 2
+  ai_analysis: 2
+
+# ---------------------------------------------------------------------------
+# Analysis: frame sampling and scene boundary refinement.
+# ---------------------------------------------------------------------------
+analysis:
+  sampling_strategy: "uniform"
+  preview_max_frames: 16
+  preview_max_width: 640
+  # Adaptive preview cost (Milestone 3.7): the frame count follows the video
+  # duration instead of always sending the maximum. Bands are checked in order;
+  # max_seconds: 0 is the catch-all. An unknown duration uses the cheapest band.
+  # Set preview_frame_adaptive: false to always use the ceiling.
+  preview_frame_adaptive: true
+  preview_frame_bands:
+    - { max_seconds: 15, frames: 6 }
+    - { max_seconds: 45, frames: 8 }
+    - { max_seconds: 90, frames: 10 }
+    - { max_seconds: 0, frames: 12 }
+  analysis_max_frames: 12
+  analysis_max_width: 720
+  # Final-clip tagging observes the clip itself (20/40/60/80% of its duration)
+  # with a small frame set - never the full source video frames.
+  clip_tagging_max_frames: 4
+  clip_frame_ratios: [0.2, 0.4, 0.6, 0.8]
+  scene_boundary_max_adjustment_seconds: 1.5
+  scene_detector_threshold: 27.0
+  scene_detector_enabled: true
+
+# ---------------------------------------------------------------------------
+# Media backend: real FFmpeg cutting.
+#   backend: "ffmpeg" | "mock" | "auto" (auto = ffmpeg when available)
+#   ffmpeg_path / ffprobe_path: empty means "discover on PATH".
+#   FOHE_FFMPEG_PATH / FOHE_FFPROBE_PATH in .env override these values.
+# ---------------------------------------------------------------------------
+media:
+  # ffmpeg：真实剪片、转码、缩略图和媒体读取；mock 只用于测试。
+  backend: "ffmpeg"
+  # 当前 Conda 环境在项目目录内，因此换盘后相对路径仍有效。
+  # 若使用独立安装版本，在 .env 设置 FOHE_FFMPEG_PATH/FOHE_FFPROBE_PATH。
+  ffmpeg_path: ".venv/Library/bin/ffmpeg.exe"
+  ffprobe_path: ".venv/Library/bin/ffprobe.exe"
+  video_codec: "libx264"
+  crf: 18
+  preset: "medium"
+  audio_codec: "aac"
+  audio_bitrate: "128k"
+  precise_cut: true
+  thumbnail_candidates: 5
+  command_timeout_seconds: 300
+  # Milestone 9.6 bounded duration resolution
+  duration_resolve_download: true
+  duration_resolve_decode_seconds: 30.0
+  duration_resolve_timeout_seconds: 60.0
+
+# ---------------------------------------------------------------------------
+# Network / retry policy for HTTP calls made by providers and downloaders.
+# ---------------------------------------------------------------------------
+network:
+  timeout_seconds: 60
+  max_retries: 2
+  backoff_seconds: 1.5
+
+# ---------------------------------------------------------------------------
+# Collection pipeline.
+# ---------------------------------------------------------------------------
+pipeline:
+  default_target_clip_count: 5
+  default_min_clip_duration: 3.0
+  default_max_clip_duration: 15.0
+  default_subtitle_policy: "strict"
+  keyword_max_queries: 10
+  max_candidates_per_task: 60
+  preview_frame_count: 8
+  analysis_frame_count: 12
+  candidate_min_duration: 5.0
+  candidate_max_duration: 300.0
+  segment_min_duration: 3.0
+  segment_max_duration: 15.0
+  max_segments_per_video: 6
+  scene_refine_tolerance_seconds: 1.5
+  scene_refine_max_expansion_ratio: 0.35
+  download_timeout_seconds: 120
+  delete_source_after_processing: true
+  cleanup_cache_on_finish: true
+  cleanup_cache_max_age_hours: 24
+  # Media backend mirrors media.backend; kept for Milestone 1 compatibility.
+  media_backend: "ffmpeg"
+
+# ---------------------------------------------------------------------------
+# Quality gate thresholds used by analyzers/quality_gate.py
+# ---------------------------------------------------------------------------
+quality:
+  min_overall_score: 0.55
+  min_material_score: 0.6
+  min_visual_quality_score: 0.5
+  # A clip whose subtitle score exceeds the policy limit is rejected.
+  # Keys are quoted because YAML 1.1 reads bare "off" as a boolean.
+  subtitle_score_limit:
+    "strict": 0.35
+    "balanced": 0.5
+    "loose": 0.7
+    "off": 1.0
+
+# ---------------------------------------------------------------------------
+# Deduplication
+#   sha256 + representative-frame pHash are the hard duplicate checks.
+#   content_key is similarity metadata only (never a hard duplicate).
+# ---------------------------------------------------------------------------
+dedup:
+  enabled: true
+  phash_max_distance: 6
+  representative_frame_timestamp_ratio: 0.5
+  use_content_key_as_duplicate: false
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+ui:
+  host: "127.0.0.1"
+  port: 7860
+  share: false
+
+# ---------------------------------------------------------------------------
+# 素材库管理 / 检索 / 审核 / 导出 (Milestone 4)
+# ---------------------------------------------------------------------------
+library:
+  default_page_size: 20          # 素材库默认每页条数
+  max_page_size: 100             # 单页上限（服务端 LIMIT/OFFSET）
+  max_export_rows: 5000          # 单次导出上限，超出需要缩小筛选范围
+  default_provenance_filter: "douyin_real"   # 默认只显示真实素材
+  exports_dir: "./exports"       # 清单导出目录（相对项目根，绝不写入素材库）
+  quarantine_dir: "./quarantine" # 孤立文件隔离目录（只移动，永不删除）
+  review_dir: "./exports"        # 审核 CSV 导入/导出目录
+
+# ---------------------------------------------------------------------------
+# 素材覆盖与采集策略 (Milestone 5)
+# 这些只是"素材库健康目标"，用于缺口报告与补采建议，不会自动触发采集。
+# ---------------------------------------------------------------------------
+coverage:
+  default_minimum_per_stage: 5   # 未单独配置的工序目标值
+  preferred_process_stages:      # 工序 -> 目标片段数
+    raw_material: 5
+    preparation: 5
+    cutting: 5
+    tray_arrangement: 8
+    drying: 8
+    inside_dryer: 5
+    unloading: 5
+    finished_product: 8
+    equipment: 5
+  count_mode: "all"              # all = 全部片段；approved = 只算已批准
+  priority_high_ratio: 0.5       # 达成率 < 50% -> 高优先级（0 -> 严重缺口）
+  priority_healthy_ratio: 1.0    # 达成率 >= 100% -> 已覆盖
+
+# ---------------------------------------------------------------------------
+# 字幕测量分析 (Milestone 6)：本地文字检测 + 几何/时间度量 + 混合判定
+# 只做检测与分类，不擦除、不修改任何视频像素。
+# ---------------------------------------------------------------------------
+subtitle_analysis:
+  enabled: true
+  engine: "auto"                 # auto | rapidocr | opencv | none
+  max_frames: 4                  # 成片片段分析帧数（含文字识别）
+  preview_max_frames: 3          # 预览帧分析帧数（仅检测，更省时）
+  hybrid_qwen: true              # 本地测量不明确时才使用 Qwen 语义判定
+  cache: true                    # 按 sha256 + 版本 + 阈值签名缓存，避免重复 OCR
+  # mock 媒体后端写的是占位图，没有画面信息：默认跳过测量
+  skip_with_mock_media: true
+  force_with_mock: false
+  debug_dir: ""                  # 设为 cache/debug 可输出标注帧（默认关闭）
+
+  # 画面分区（可调）
+  center_zone_start: 0.25
+  bottom_zone_start: 0.72
+  band_min_width: 0.70           # 超过该宽度算“横幅”
+  band_min_height: 0.08          # 但还必须够厚，细长底字幕不算横幅
+
+  # 分类阈值（可调）
+  simple_bottom_max_area: 0.12   # 简单底部字幕最大覆盖面积
+  simple_bottom_max_regions: 3   # 最多几行算简单底部字幕
+  large_center_min_area: 0.10    # 中央大字判定门槛
+  dense_text_area: 0.25          # 文字总覆盖超过此值算密集文字
+  multi_region_min_persistence: 0.40
+  center_text_reject_persistence: 0.50
+  band_min_persistence: 0.40
+
+  # 洁净度扣分权重（1 - 各项扣分，公式见 analyzers/subtitle_analysis.py）
+  cleanliness_weights:
+    center_text: 0.45
+    multi_region: 0.35
+    text_area: 0.30
+    band: 0.25
+    dense_text: 0.20
+    bottom_simple: 0.08
+    top_simple: 0.06
+    watermark: 0.02
+    promotion: 0.25
+
+# ---------------------------------------------------------------------------
+# 保守的本地字幕清理 (Milestone 9.2)
+#   优先级：保留可用画面 > 去字幕。
+#   只对 bottom_simple / top_simple / single_region 且几何稳定的片段尝试；
+#   原始 clips/ 文件不可变，清理结果写到 <分类>/clean/<原名>__subtitle_cleanup_v1.mp4。
+#   失败/不确定时不替换原片，只记录 subtitle_cleanups 状态。
+# ---------------------------------------------------------------------------
+subtitle_cleanup:
+  enabled: true
+  version: "subtitle_cleanup_v1"
+  eligible_classes: ["bottom_simple", "top_simple", "single_region"]
+
+  # 仅对候选片段执行的本地 OCR 几何采样（不调用 Qwen / 云端）
+  sample_fps: 2.0
+  max_samples: 240
+  min_samples: 2
+  min_confidence: 0.30
+
+  # 时间轨迹关联与稳定性阈值
+  min_iou: 0.20
+  max_center_distance: 0.10
+  min_persistence: 0.55
+  min_track_seconds: 0.30
+  max_vertical_jitter: 0.05
+  max_union_growth: 0.75
+  max_union_area_ratio: 0.15
+  max_region_area_ratio: 0.10
+
+  # 掩码几何安全上限：拒绝“大黑块”式清理
+  margin_ratio: 0.02
+  min_margin_pixels: 4
+  max_width_ratio: 0.90
+  max_height_ratio: 0.30
+  max_total_area_ratio: 0.20
+  max_regions: 3
+
+  # 付费云处理前置拦截：字幕背后若是持续存在的纯色矩形底板，云端无法恢复
+  # 已被底板覆盖的原始像素，因此不上传、不创建付费任务。
+  backing_block_dominant_ratio_min: 0.50
+  backing_block_ring_ratio_max: 0.30
+  backing_block_min_persistence: 0.50
+
+  # 时间范围：字幕仅出现一小段时，不整段擦除
+  time_scoped: true
+  padding_seconds: 0.20
+
+  # 确定性本地引擎（FFmpeg delogo；无生成式/云端方案）
+  engine: "ffmpeg_delogo"
+  # v2 可切换为 opencv_inpaint；先保留 v1 默认，完成真实视觉验收后启用。
+  inpaint_radius: 3.0
+
+  # 清理后 OCR 证据必须可量化减少；质量门失败则保留原片
+  min_evidence_reduction: 0.50
+  duration_tolerance_seconds: 0.75
+  resolution_tolerance_pixels: 2
+  outside_mean_diff_max: 12.0
+  blur_ratio_min: 0.05
+  region_std_ratio_min: 0.35
+  # 方向纹理塌缩必须持续出现在超过20%的采样遮罩区域才判失败；避免把字幕
+  # 字形边缘消失或景深虚化背景中的单帧低纹理误判为涂抹。
+  directional_smear_fraction_max: 0.20
+  flat_region_edge_std_min: 1.0
+  dark_region_mean_max: 20.0
+  dark_region_std_max: 6.0
+
+  # ---- Milestone 9.3 生产流程 ----
+  # 自动成功不代表视觉批准：未人工 approved 的派生不会进入 preferred_media_path。
+  require_review_before_preferred: true
+  # 成功后尽力生成静态复核包（reports/subtitle_cleanup/.../index.html）
+  review_pack: true
+  reports_dir: "./reports"
+  review_pack_ratios: [0.2, 0.5, 0.8]
+  # 新入库片段自动做 cleanup 资格分类（只读 subtitle_analysis_v1，不 OCR/不剪片）
+  post_acquisition_routing: true
+  # 破坏性清理默认关闭；仅验收运行显式加 --cleanup-new-clips 才尝试
+  post_acquisition_auto_cleanup: false
+  # 单次采集最多尝试清理 2 个新 eligible 片段
+  post_acquisition_max_cleanup: 2
+
+# ---------------------------------------------------------------------------
+# 采集计划 / 人工审批 / 批量执行预算 (Milestone 7)
+# 计划不会自行运行：必须人工批准后显式执行；预算到上限会自动暂停。
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 覆盖驱动的生产采集 (Milestone 9)
+#   python app.py --production-gaps                  # 按优先级列出真实缺口
+#   python app.py --create-production-plan --category 辣椒干 --stage drying
+# 目标只写在这里；SQL/UI 不硬编码。缺口 = 目标 − 库里已有的片段数。
+# ---------------------------------------------------------------------------
+production_coverage:
+  # 生产物料清单（小规模、显式）；库里已有的分类也会被纳入
+  materials: ["苹果干", "香菇干", "红薯干", "香蕉干", "芒果干", "辣椒干"]
+  # 每个工序希望达到的最少片段数（未列出的工序不作为生产目标）
+  process_stage_targets:
+    drying: 2
+    inside_dryer: 1
+    before_drying: 1
+    finished_product: 2
+    equipment: 1
+    factory: 1
+    loading: 1
+    tray_arrangement: 1
+    unloading: 1
+    packaging: 1
+    preparation: 1
+  # 工序优先级（1 最高）：先补烘干核心工序，再补次要工序
+  stage_priorities:
+    drying: 1
+    inside_dryer: 2
+    before_drying: 3
+    finished_product: 4
+    equipment: 5
+    factory: 6
+    loading: 7
+    tray_arrangement: 8
+    unloading: 9
+    packaging: 10
+    preparation: 11
+  stage_priority_default: 20
+  # 单个目标的保守生产预算（先小规模、人工在环）
+  default_item_target_clips: 1
+  # Milestone 9.4: bounded production run keeps preview/candidate budget <= 8
+  default_item_candidates: 8
+  default_item_downloads: 4
+  default_item_tokens: 60000
+  max_items_per_plan: 3
+  queries_per_item: 4
+  # 优先级权重（透明、确定；公式见 core/production.py）
+  weight_stage: 3.0
+  weight_gap: 1.0
+  weight_edit_role: 1.5
+  weight_query_yield: 2.0
+  penalty_duplicate: 2.0
+  penalty_subtitle: 1.5
+  penalty_tokens: 1.0
+  token_reference: 60000
+  recently_processed_weight: 2.0
+
+# ---------------------------------------------------------------------------
+# Novelty / query-space saturation (Milestone 9.5)
+# 独立的 production-level 层：query_rank_v2 公式本身不变，只额外暴露
+# library novelty / known-source rate / saturation / actionability。
+# ---------------------------------------------------------------------------
+novelty:
+  enabled: true
+  window_days: 30
+  saturation_expiry_days: 30
+  min_candidates_for_saturation: 4
+  min_samples_for_saturation: 3
+  saturated_known_source_rate: 0.90
+  mixed_known_source_rate: 0.50
+  recent_zero_novelty_runs: 2
+  fresh_min_novelty_rate: 0.25
+  unverified_query_prior: 0.5
+  actionability_fresh: 1.0
+  actionability_unknown: 0.70
+  actionability_mixed: 0.50
+  actionability_saturated: 0.10
+  saturated_primary_penalty: 0.50
+  share_weight_fresh: 1.0
+  share_weight_unknown: 1.0
+  share_weight_mixed: 0.5
+  share_weight_saturated: 0.0
+  primary_queries_per_item: 4
+  reserve_queries_per_item: 4
+  reserve_enabled: true
+
+# ---------------------------------------------------------------------------
+# Volcano Engine VOD 精细字幕擦除 (Milestone 9.8)
+#   cloud cleanup 默认关闭、付费、显式 --engine volcengine 才调用；
+#   AK/SK 只从 .env/env 读取，绝不写入本文件或 SQLite。
+# ---------------------------------------------------------------------------
+cloud_cleanup:
+  enabled: false
+  engine: "local"          # local | volcengine | manual
+  max_paid_tasks_per_run: 3 # 单次批处理最多创建的付费任务数（硬上限）
+  max_paid_tasks_per_day: 10 # 每个 UTC 自然日最多创建的付费任务数
+  volcengine:
+    endpoint: "https://vod.volcengineapi.com"
+    region: ""             # 例如 cn-north-1；也可用 VOLCENGINE_REGION
+    space_name: ""         # 也可用 VOLCENGINE_VOD_SPACE_NAME
+    access_key_env: "VOLCENGINE_ACCESS_KEY_ID"
+    secret_key_env: "VOLCENGINE_SECRET_ACCESS_KEY"
+    space_env: "VOLCENGINE_VOD_SPACE_NAME"
+    region_env: "VOLCENGINE_REGION"
+    storage_domain_env: "VOLCENGINE_VOD_STORAGE_DOMAIN"
+    url_auth_key_env: "VOLCENGINE_VOD_URL_AUTH_KEY"
+    url_auth_ttl_seconds: 600 # 自动下载签名有效期；密钥仅存 .env
+    api_version: "2025-01-01"
+    poll_interval_seconds: 10
+    max_poll_seconds: 1800
+    request_timeout_seconds: 30
+    auto_type: "Subtitle"  # policy: never automatically Text
+    locations_margin_ratio: 0.01
+    sdk_enabled: true
+    watermark_min_persistence: 0.30
+    watermark_max_vertical_jitter: 0.08
+    watermark_max_union_growth: 1.50
+    discover_space_region: true
+
+collection_planning:
+  max_requested_clips_per_stage: 5    # 单个工序一次最多申请多少片段
+  max_plan_target_clips: 20           # 整个计划的目标上限
+  max_items_per_plan: 6               # 一个计划最多包含多少工序目标
+
+  max_plan_previews: 60               # 计划级上限（各目标预算之和必须适配）
+  max_plan_downloads: 20
+  max_plan_ai_tokens: 300000
+  max_plan_runtime_minutes: 120
+
+  default_item_candidates: 24         # 单目标默认唯一候选上限
+  default_item_downloads: 4
+  default_item_tokens: 60000
+  max_item_runtime_minutes: 30
+
+  token_reserve_ratio: 0.10           # token 硬上限的安全余量
+  estimated_tokens_per_preview: 7000  # 缺少历史时的估算值
+  estimated_tokens_per_analysis: 18000
+
+  # ---- query_rank_v1：M7 的旧公式，语义已冻结，仅用于对比报表 ----
+  query_weight_clips: 3.0
+  query_weight_accepted: 1.0
+  query_weight_conversion: 2.0
+  query_weight_approved: 0.5
+  query_penalty_subtitle: 2.5         # 字幕淘汰率惩罚
+  query_penalty_duplicate: 1.5        # 重复发现率惩罚
+  query_penalty_tokens: 1.5           # token 效率惩罚
+  query_token_reference: 60000
+
+  # ---- query_rank_v2：M8 校准公式（新计划默认使用）----
+  #  score = ( w_yield*log1p(clips) + w_conv*(clips/candidates) ) * unique_rate
+  #          + w_approved*log1p(approved)
+  #          - w_sub*字幕淘汰率
+  #          - w_tok*min(1, tokens每片段/token_reference)
+  #          - w_zero_clip*min(1, log1p(tokens)/log1p(token_reference))   # 零片段却花钱
+  #          - w_zero_yield                                                # 有候选但零片段
+  #          × confidence(samples/(samples+k), samples=唯一候选数)
+  #  详见 core/planner.py: Planner.score_v2
+  ranking_version: "query_rank_v2"
+  rank2_weight_yield: 3.0             # 历史产出（log 归一化，避免线性膨胀）
+  rank2_weight_conversion: 2.0        # 转化率
+  rank2_weight_approved: 0.6          # 人工批准加分（非必需条件）
+  rank2_duplicate_power: 1.0          # 唯一率阻尼指数（27 候选 3 唯一 → ×0.11）
+  rank2_penalty_subtitle: 2.5
+  rank2_penalty_tokens: 1.5
+  rank2_penalty_zero_clip_tokens: 3.0 # 零片段但有 token 消耗
+  rank2_penalty_zero_yield: 1.0       # 有候选但零片段
+  rank2_zero_yield_min_candidates: 5
+  rank2_token_reference: 60000
+  rank2_confidence_k: 5.0             # 样本量置信度：samples/(samples+k)
+
+  max_concurrent_collection_tasks: 1  # 保守：不并发跑多个抖音采集
+  require_approval: true              # 草稿必须人工批准（不可关闭自动执行）

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+venv/
+
+# Secrets - never commit real API keys
+.env
+
+# Runtime output
+data/
+cache/
+library/
+logs/
+.pytest-tmp/
+.pytest-tmp*/
+.pytest_cache/
+.test-runs/
+
+# Local scratch
+exports/
+reports/
+.gradio_app.backup.py
+.smoke/
+.ui-check*.log
+.demo-library/
+.demo.log
+.stub.*.log
+.pytest-*.log
+.runC.log
+.smoke-lib/
+.recon_douyin*.py
+.dtk-demo-cookies.txt
+# Persistent Playwright profile: contains a browser session, never commit it
+browser_data/
+quarantine/
